@@ -16,6 +16,8 @@ from torch.nn import functional as F
 
 from mingpt.utils import CfgNode as CN
 
+from einops import rearrange
+
 # -----------------------------------------------------------------------------
 
 class NewGELU(nn.Module):
@@ -26,71 +28,57 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-class CausalSelfAttention(nn.Module):
-    """
-    A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
-    """
 
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+# lucidrains' implementation of mlpmixer
+def FeedForward(dim, expansion_factor = 4, dropout = 0., dense = nn.Linear):
+    inner_dim = int(dim * expansion_factor)
+    return nn.Sequential(
+        dense(dim, inner_dim),
+        NewGELU(),
+        nn.Dropout(dropout),
+        dense(inner_dim, dim),
+        nn.Dropout(dropout)
+    )
+
+
+# causal conv1d layer
+class CausalPointwise(nn.Conv1d):
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super().__init__(in_channels, out_channels, kernel_size = 1, **kwargs)
+        self.register_buffer('mask', torch.triu(torch.ones((in_channels, out_channels))))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        b, t, e = x.shape
+        x = rearrange(x, 'b t e -> (b e) t')
+        #print(x.shape, self.mask.shape, self.weight.shape)
+        y = torch.einsum('ij,jk,kj->ik', x, self.mask, self.weight.squeeze()) + self.bias
+        return rearrange(y, '(b e) t -> b t e', b = b)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-class Block(nn.Module):
-    """ an unassuming Transformer block """
-
-    def __init__(self, config):
+class PreNormResidual(nn.Module):
+    def __init__(self, dim, fn):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
-            act     = NewGELU(),
-            dropout = nn.Dropout(config.resid_pdrop),
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
-        return x
+        return self.fn(self.norm(x)) + x
+
+
+def Block(config):
+    """ an unassuming causal MLPMixer block """
+    dim = config.n_embd
+    num_patches = config.block_size
+    expansion_factor = 4
+    dropout = config.resid_pdrop
+    expansion_factor_token=0.5
+    chan_first, chan_last = CausalPointwise, nn.Linear
+
+    return nn.Sequential(
+            PreNormResidual(dim, FeedForward(num_patches, expansion_factor, dropout, chan_first)),
+            PreNormResidual(dim, FeedForward(dim, expansion_factor_token, dropout, chan_last))
+            )
+
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -98,10 +86,9 @@ class GPT(nn.Module):
     @staticmethod
     def get_default_config():
         C = CN()
-        # either model_type or (n_layer, n_head, n_embd) must be given in the config
-        C.model_type = 'gpt'
+        # either model_type or (n_layer, n_embd) must be given in the config
+        C.model_type = 'gpt-mini'
         C.n_layer = None
-        C.n_head = None
         C.n_embd =  None
         # these options must be filled in externally
         C.vocab_size = None
@@ -119,26 +106,26 @@ class GPT(nn.Module):
         self.block_size = config.block_size
 
         type_given = config.model_type is not None
-        params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
+        params_given = all([config.n_layer is not None, config.n_embd is not None])
         assert type_given ^ params_given # exactly one of these (XOR)
         if type_given:
             # translate from model_type to detailed configuration
             config.merge_from_dict({
                 # names follow the huggingface naming conventions
                 # GPT-1
-                'openai-gpt':   dict(n_layer=12, n_head=12, n_embd=768),  # 117M params
+                'openai-gpt':   dict(n_layer=12, n_embd=768),  # 117M params
                 # GPT-2 configs
-                'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-                'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-                'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-                'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+                'gpt2':         dict(n_layer=12, n_embd=768),  # 124M params
+                'gpt2-medium':  dict(n_layer=24, n_embd=1024), # 350M params
+                'gpt2-large':   dict(n_layer=36, n_embd=1280), # 774M params
+                'gpt2-xl':      dict(n_layer=48, n_embd=1600), # 1558M params
                 # Gophers
-                'gopher-44m':   dict(n_layer=8, n_head=16, n_embd=512),
+                'gopher-44m':   dict(n_layer=8, n_embd=512),
                 # (there are a number more...)
                 # I made these tiny models up
-                'gpt-mini':     dict(n_layer=6, n_head=6, n_embd=192),
-                'gpt-micro':    dict(n_layer=4, n_head=4, n_embd=128),
-                'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
+                'gpt-mini':     dict(n_layer=6, n_embd=192),
+                'gpt-micro':    dict(n_layer=4, n_embd=128),
+                'gpt-nano':     dict(n_layer=3, n_embd=48),
             }[config.model_type])
 
         self.transformer = nn.ModuleDict(dict(
@@ -308,3 +295,32 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+if __name__ == '__main__':
+    config = GPT.get_default_config()
+    config.block_size = 10
+    config.vocab_size = 100
+    model = GPT(config)
+    assert hasattr(model, 'generate')
+    idx = torch.randint(0, 100, (2, 10))
+    x = idx
+    y, _ = model(x)
+    print(y.size())
+
+    tok_emb = model.transformer.wte(x) # token embeddings of shape (b, t, n_embd)
+    tok_emb = tok_emb.detach()
+    tok_emb.requires_grad = True
+    x = tok_emb
+    for block in model.transformer.h:
+        x = block(x)
+    x = model.transformer.ln_f(x)
+    logits = model.lm_head(x)
+    #b, t, n = logits.size()
+    #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), idx.view(-1), ignore_index=-1, reduction='none')
+    #loss = loss.view(b, t)
+    for i in range(config.block_size):
+        logits[:, i].sum().backward(retain_graph=True)
+        g = tok_emb.grad.sum(2).sum(0)
+        print(g)
+        tok_emb.grad.zero_()
+        #assert torch.allclose(torch.abs(g) > 1e-9, torch.arange(10) < i + 1e-3), g

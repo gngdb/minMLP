@@ -100,6 +100,7 @@ if __name__ == '__main__':
     config.model.vocab_size = train_dataset.get_vocab_size()
     config.model.block_size = train_dataset.get_block_size()
     model = GPT(config.model)
+    assert hasattr(model, 'generate'), 'model must have a generate method'
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
