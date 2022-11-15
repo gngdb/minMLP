@@ -29,7 +29,7 @@ def get_config():
 
     # model
     C.model = GPT.get_default_config()
-    C.model.model_type = 'gpt-mini'
+    #C.model.model_type = 'gpt-mini'
 
     # trainer
     C.trainer = Trainer.get_default_config()
@@ -99,6 +99,7 @@ if __name__ == '__main__':
     # construct the model
     config.model.vocab_size = train_dataset.get_vocab_size()
     config.model.block_size = train_dataset.get_block_size()
+    print(config.model)
     model = GPT(config.model)
 
     # construct the trainer object

@@ -1,12 +1,13 @@
 from setuptools import setup
 
-setup(name='minGPT',
+setup(name='minMLP',
       version='0.0.1',
-      author='Andrej Karpathy',
-      packages=['mingpt'],
-      description='A PyTorch re-implementation of GPT',
+      author='Gavia Gray',
+      packages=['minmlp'],
+      description='A PyTorch implementation of a causal MLP-Mixer',
       license='MIT',
       install_requires=[
             'torch',
+            'einops'
       ],
 )

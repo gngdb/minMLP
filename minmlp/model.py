@@ -1,13 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
 
 import torch
@@ -48,12 +38,8 @@ class CausalPointwise(nn.Conv1d):
         self.register_buffer('mask', torch.triu(torch.ones((in_channels, out_channels))))
 
     def forward(self, x):
-        b, t, e = x.shape
-        x = rearrange(x, 'b t e -> (b e) t')
-        #print(x.shape, self.mask.shape, self.weight.shape)
-        y = torch.einsum('ij,jk,kj->ik', x, self.mask, self.weight.squeeze()) + self.bias
-        return rearrange(y, '(b e) t -> b t e', b = b)
-
+        w = self.weight * rearrange(self.mask, 'i j -> j i ()')
+        return F.conv1d(x, w, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 class PreNormResidual(nn.Module):
     def __init__(self, dim, fn):
@@ -87,7 +73,7 @@ class GPT(nn.Module):
     def get_default_config():
         C = CN()
         # either model_type or (n_layer, n_embd) must be given in the config
-        C.model_type = 'gpt-mini'
+        C.model_type = None
         C.n_layer = None
         C.n_embd =  None
         # these options must be filled in externally
@@ -128,7 +114,7 @@ class GPT(nn.Module):
                 'gpt-nano':     dict(n_layer=3, n_embd=48),
             }[config.model_type])
 
-        self.transformer = nn.ModuleDict(dict(
+        self.mlpmixer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.embd_pdrop),
@@ -144,7 +130,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
-        n_params = sum(p.numel() for p in self.transformer.parameters())
+        n_params = sum(p.numel() for p in self.mlpmixer.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
 
     def _init_weights(self, module):
@@ -158,47 +144,6 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
 
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """
-        Initialize a pretrained GPT model by copying over the weights
-        from a huggingface/transformers checkpoint.
-        """
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-
-        # create a from-scratch initialized minGPT model
-        config = cls.get_default_config()
-        config.model_type = model_type
-        config.vocab_size = 50257 # openai's model vocabulary
-        config.block_size = 1024  # openai's model block_size
-        model = GPT(config)
-        sd = model.state_dict()
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
-        # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
-        for k in keys:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
-
     def configure_optimizers(self, train_config):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
@@ -210,7 +155,7 @@ class GPT(nn.Module):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
+        whitelist_weight_modules = (torch.nn.Linear, CausalPointwise)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
@@ -251,12 +196,12 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        tok_emb = self.mlpmixer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.mlpmixer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.mlpmixer.drop(tok_emb + pos_emb)
+        for block in self.mlpmixer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.mlpmixer.ln_f(x)
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
@@ -276,7 +221,11 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            # if the sequence is too short we must concatenate some padding to the front
+            pad = torch.zeros(idx.size(0), self.block_size - idx_cond.size(1), dtype=torch.long, device=idx.device)
+            idx_cond = torch.cat([pad, idx_cond], dim=1)
             # forward the model to get the logits for the index in the sequence
+            assert idx_cond.size(1) == self.block_size, f"idx_cond.size(1)={idx_cond.size(1)} but block_size={self.block_size}"
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
@@ -307,13 +256,13 @@ if __name__ == '__main__':
     y, _ = model(x)
     print(y.size())
 
-    tok_emb = model.transformer.wte(x) # token embeddings of shape (b, t, n_embd)
+    tok_emb = model.mlpmixer.wte(x) # token embeddings of shape (b, t, n_embd)
     tok_emb = tok_emb.detach()
     tok_emb.requires_grad = True
     x = tok_emb
-    for block in model.transformer.h:
+    for block in model.mlpmixer.h:
         x = block(x)
-    x = model.transformer.ln_f(x)
+    x = model.mlpmixer.ln_f(x)
     logits = model.lm_head(x)
     #b, t, n = logits.size()
     #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), idx.view(-1), ignore_index=-1, reduction='none')
